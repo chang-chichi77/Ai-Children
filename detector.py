@@ -332,7 +332,7 @@ class MotionTracker:
 
 def send_alert(ts):
   try:
-    requests.post(FLASK_API_URL, json={'event': 'fall_10s_confirmed', 'time': ts, 'confidence': 0.90}, timeout=5)
+    requests.post(FLASK_API_URL, json={'event': 'fall_5s_confirmed', 'time': ts, 'confidence': 0.90}, timeout=5)
     print('警報已送出')
     return True
   except Exception as e:
@@ -367,6 +367,7 @@ def main(source=0):
   roi_lock_frame = 0
   motion_tracker = MotionTracker()
   GRACE_PERIOD_SECONDS = 3.0  # 進入跌倒狀態後,允許中斷(掙扎/暫時抓不到骨架)的最大容忍秒數
+  FALL_CONFIRM_SECONDS = 5.0  # 跌倒狀態持續多久才確認送出警報
 
   while cap.isOpened():
     ret, frame = cap.read()
@@ -434,11 +435,11 @@ def main(source=0):
         frame = draw_chinese_text(frame, '正常', (20, 40), font_large, (0, 255, 0))
       else:
         elapsed = (now - fall_time).total_seconds()
-        remaining = max(0, 10 - elapsed)
+        remaining = max(0, FALL_CONFIRM_SECONDS - elapsed)
 
-        if elapsed >= 10 and not reported:
+        if elapsed >= FALL_CONFIRM_SECONDS and not reported:
           reported = True
-          print('跌倒狀態已持續超過 10 秒，確認警報!')
+          print(f'跌倒狀態已持續超過 {FALL_CONFIRM_SECONDS:.0f} 秒，確認警報!')
           send_alert(now_str)
 
         frame = draw_chinese_text(frame, '危險 - 偵測到跌倒', (20, 40), font_large, (0, 0, 255))
