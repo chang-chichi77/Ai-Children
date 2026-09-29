@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+import argparse
 import math
 import os
+import time
+from collections import deque
 import cv2
 import numpy as np
 from datetime import datetime
@@ -68,7 +71,7 @@ def create_object_detector():
   options = vision.ObjectDetectorOptions(
       base_options=BaseOptions(model_asset_path=OBJECT_MODEL_PATH),
       running_mode=vision.RunningMode.IMAGE,
-      score_threshold=0.3,
+      score_threshold=0.4,
       category_allowlist=['person'],
       max_results=5,
   )
@@ -212,10 +215,7 @@ def detect_fall(raw_points):
     return False
 
   try:
-    xs = [p[0] for p in raw_points.values()]
-    ys = [p[1] for p in raw_points.values()]
-    width = max(xs) - min(xs)
-    height = max(ys) - min(ys)
+    width, height = bbox_dims(raw_points)
 
     if height < 1e-5:
       return False
@@ -252,6 +252,84 @@ def detect_fall(raw_points):
   except:
     return False
 
+MOTION_WINDOW_SECONDS = 1.0    # 計算速度用的取樣時間窗口
+MOTION_STALE_SECONDS = 1.5     # 樣本間隔超過這麼久視為不連續(骨架斷過久),整批捨棄重新累積
+MOTION_MIN_DT = 0.05           # 時間差太小則跳過,避免雜訊放大成離譜的速度值
+MOTION_VELOCITY_THRESHOLD = 2.0  # 下墜速度門檻,單位:身高(bbox 高度)/秒
+MOTION_ACCEL_THRESHOLD = 4.0     # 下墜加速度門檻,單位:身高/秒^2
+
+def bbox_dims(raw_points):
+  xs = [p[0] for p in raw_points.values()]
+  ys = [p[1] for p in raw_points.values()]
+  return max(xs) - min(xs), max(ys) - min(ys)
+
+class MotionTracker:
+  """用實際時間差(而非幀數)追蹤骨架中心點的下墜速度/加速度。
+
+  卡頓造成的不固定 dt 會直接反映在算出的速度裡而不會失真;若中間斷點
+  過久(骨架長時間抓丟)則捨棄舊樣本重新累積,避免用隔太久的兩點硬算速度。
+  """
+
+  def __init__(self):
+    self.samples = deque()  # (timestamp, center_y, body_height)
+    self.last_velocity = None  # (timestamp, velocity_y)
+
+  def reset(self):
+    self.samples.clear()
+    self.last_velocity = None
+
+  def update(self, raw_points, now):
+    if not raw_points or len(raw_points) < 4:
+      return False
+
+    ls = raw_points.get(PL.LEFT_SHOULDER)
+    rs = raw_points.get(PL.RIGHT_SHOULDER)
+    lh = raw_points.get(PL.LEFT_HIP)
+    rh = raw_points.get(PL.RIGHT_HIP)
+    torso_pts = [p for p in (ls, rs, lh, rh) if p]
+    if len(torso_pts) < 2:
+      return False
+
+    _, height = bbox_dims(raw_points)
+    if height < 1e-5:
+      return False
+
+    center_y = sum(p[1] for p in torso_pts) / len(torso_pts)
+
+    if self.samples and (now - self.samples[-1][0]).total_seconds() > MOTION_STALE_SECONDS:
+      self.reset()
+
+    self.samples.append((now, center_y, height))
+    while self.samples and (now - self.samples[0][0]).total_seconds() > MOTION_WINDOW_SECONDS:
+      self.samples.popleft()
+
+    if len(self.samples) < 2:
+      return False
+
+    t0, y0, h0 = self.samples[0]
+    t1, y1, h1 = self.samples[-1]
+    dt = (t1 - t0).total_seconds()
+    if dt < MOTION_MIN_DT:
+      return False
+
+    avg_h = (h0 + h1) / 2.0
+    velocity_y = ((y1 - y0) / dt) / avg_h  # 正值代表往下墜落(影像 y 軸向下為正)
+
+    is_fast_fall = velocity_y > MOTION_VELOCITY_THRESHOLD
+
+    accel_triggered = False
+    if self.last_velocity is not None:
+      pt, pv = self.last_velocity
+      dvt = (t1 - pt).total_seconds()
+      if dvt >= MOTION_MIN_DT:
+        accel = (velocity_y - pv) / dvt
+        if velocity_y > 0 and accel > MOTION_ACCEL_THRESHOLD:
+          accel_triggered = True
+
+    self.last_velocity = (t1, velocity_y)
+
+    return is_fast_fall or accel_triggered
+
 def send_alert(ts):
   try:
     requests.post(FLASK_API_URL, json={'event': 'fall_10s_confirmed', 'time': ts, 'confidence': 0.90}, timeout=5)
@@ -261,17 +339,24 @@ def send_alert(ts):
     print(f'警報送出失敗:{e}')
     return False
 
-def main():
+def main(source=0):
+  is_file_source = isinstance(source, str)
   print('獨居長者跌倒偵測系統（圖像增強+人體解剖驗證）')
+  print(f'輸入來源:{"檔案 " + source if is_file_source else "攝影機"}')
   print('按 q 離開 | 按 r 重置 | 按 c 重新鎖定\n')
 
-  cap = cv2.VideoCapture(0)
+  cap = cv2.VideoCapture(source)
   if not cap.isOpened():
-    print('無法開啟攝影機')
+    print('無法開啟輸入來源')
     return
+
+  if not is_file_source:
+    cap.set(cv2.CAP_PROP_FPS, 60)
 
   fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
   fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+  prev_tick = time.perf_counter()
+  display_fps = 0.0
 
   landmarker = create_pose_landmarker()
   object_detector = create_object_detector()
@@ -280,6 +365,7 @@ def main():
   last_vllm_check_time = None
   roi = None
   roi_lock_frame = 0
+  motion_tracker = MotionTracker()
   GRACE_PERIOD_SECONDS = 3.0  # 進入跌倒狀態後,允許中斷(掙扎/暫時抓不到骨架)的最大容忍秒數
 
   while cap.isOpened():
@@ -287,7 +373,15 @@ def main():
     if not ret:
       break
 
-    frame = cv2.flip(frame, 1)
+    if not is_file_source:
+      frame = cv2.flip(frame, 1)
+
+    tick = time.perf_counter()
+    frame_dt = tick - prev_tick
+    prev_tick = tick
+    if frame_dt > 0:
+      display_fps = display_fps * 0.9 + (1.0 / frame_dt) * 0.1  # 指數移動平均,避免數字跳動太快
+
     now = datetime.now()
     now_str = now.strftime('%Y-%m-%d %H:%M:%S')
     fc += 1
@@ -300,7 +394,9 @@ def main():
         roi = (max(0, x1-50), max(0, y1-50), min(fw, x2+50), min(fh, y2+50))
 
     frame, raw_points = detect_skeleton_in_roi(landmarker, frame, fh, fw, roi)
-    is_fall = detect_fall(raw_points) if raw_points else False
+    pose_is_fall = detect_fall(raw_points) if raw_points else False
+    motion_is_fall = motion_tracker.update(raw_points, now)
+    is_fall = pose_is_fall or motion_is_fall
 
     if is_fall:
       last_fall_seen_time = now
@@ -355,6 +451,7 @@ def main():
       cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 255), 2)
 
     frame = draw_chinese_text(frame, now_str, (fw - 280, 20), font_medium, (255, 255, 255))
+    frame = draw_chinese_text(frame, f'FPS: {display_fps:.1f}', (fw - 280, 50), font_medium, (255, 255, 255))
     cv2.imshow('Fall Detection', frame)
 
     key = cv2.waitKey(1) & 0xFF
@@ -362,8 +459,10 @@ def main():
       break
     elif key == ord('r'):
       fall_time, reported, fall_cnt = None, False, 0
+      motion_tracker.reset()
     elif key == ord('c'):
       roi = None
+      motion_tracker.reset()
       print('重新鎖定位置...')
 
   landmarker.close()
@@ -373,4 +472,7 @@ def main():
   print('系統已關閉')
 
 if __name__ == '__main__':
-  main()
+  parser = argparse.ArgumentParser(description='獨居長者跌倒偵測系統')
+  parser.add_argument('--source', type=str, default=None, help='影片檔案路徑,不指定則使用攝影機')
+  args = parser.parse_args()
+  main(args.source if args.source else 0)
