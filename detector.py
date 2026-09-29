@@ -263,6 +263,16 @@ def bbox_dims(raw_points):
   ys = [p[1] for p in raw_points.values()]
   return max(xs) - min(xs), max(ys) - min(ys)
 
+def skeleton_bbox(raw_points, fh, fw, margin=50):
+  """用骨架點的 bounding box(往外擴 margin)取代物件偵測框,
+  讓 ROI 能跟著人實際的姿態/位置走,而不是卡在物件偵測器最後一次
+  成功鎖定的舊位置(跌倒後物件偵測器常常認不出趴姿的「person」)。
+  """
+  xs = [p[0] for p in raw_points.values()]
+  ys = [p[1] for p in raw_points.values()]
+  x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+  return (max(0, x1 - margin), max(0, y1 - margin), min(fw, x2 + margin), min(fh, y2 + margin))
+
 class MotionTracker:
   """用實際時間差(而非幀數)追蹤骨架中心點的下墜速度/加速度。
 
@@ -367,7 +377,7 @@ def main(source=0):
   roi_lock_frame = 0
   motion_tracker = MotionTracker()
   GRACE_PERIOD_SECONDS = 3.0  # 進入跌倒狀態後,允許中斷(掙扎/暫時抓不到骨架)的最大容忍秒數
-  FALL_CONFIRM_SECONDS = 5.0  # 跌倒狀態持續多久才確認送出警報
+  FALL_CONFIRM_SECONDS = 15.0  # 跌倒狀態持續多久才確認送出警報
 
   while cap.isOpened():
     ret, frame = cap.read()
@@ -388,13 +398,20 @@ def main(source=0):
     fc += 1
 
     if roi is None or (fc - roi_lock_frame) % 30 == 0:
-      roi = detect_largest_person_box(object_detector, frame, fh, fw)
-      if roi:
+      new_roi = detect_largest_person_box(object_detector, frame, fh, fw)
+      if new_roi:
         roi_lock_frame = fc
-        x1, y1, x2, y2 = roi
+        x1, y1, x2, y2 = new_roi
         roi = (max(0, x1-50), max(0, y1-50), min(fw, x2+50), min(fh, y2+50))
+      # 物件偵測器這次沒找到「person」(例如趴姿信心分數不足)時,
+      # 沿用上一次鎖定的區域繼續嘗試姿態偵測,不整個放棄清空,
+      # 避免趴姿造成 ROI 中斷太久而被寬容期誤判為「起身」
 
     frame, raw_points = detect_skeleton_in_roi(landmarker, frame, fh, fw, roi)
+
+    if raw_points:
+      roi = skeleton_bbox(raw_points, fh, fw)
+
     pose_is_fall = detect_fall(raw_points) if raw_points else False
     motion_is_fall = motion_tracker.update(raw_points, now)
     is_fall = pose_is_fall or motion_is_fall
