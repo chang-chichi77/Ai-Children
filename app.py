@@ -3,10 +3,8 @@ import os
 import logging
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
-from linebot import LineBotApi
-from linebot.exceptions import LineBotApiError
-from linebot.models import FlexSendMessage
 from db import MysqlAccess
+import requests
 
 load_dotenv()
 
@@ -19,18 +17,26 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-USER_ID_TO_PUSH = os.getenv("LINE_USER_ID")
+# c.ai 平台設定：透過 ETA 訊息發送 API 觸發 c.ai 事件，由 c.ai 腳本推播卡片到 LINE Bot
+# 值取自 c.ai 機器人管理 > 進階 > 通知服務設定（測試用模擬環境，上線用發佈環境）
+CAI_ETA_URL = os.getenv("CAI_ETA_URL", "")  # 通知服務設定的「服務 Url」，例如 https://cai-innoserve.gss.com.tw/eta
+CAI_BOT_ID = os.getenv("CAI_BOT_ID")  # Subscription Id
+CAI_SUBSCRIPTION_KEY = os.getenv("CAI_SUBSCRIPTION_KEY")  # 通知金鑰
+CAI_EVENT_NAME = os.getenv("CAI_EVENT_NAME", "fall_detected")  # 需與 c.ai 設定的事件名稱一致
+CAI_CHANNEL = os.getenv("CAI_CHANNEL", "")  # 只推播到特定頻道；留空則推到發佈設定勾選的所有頻道
+CAI_TIMEOUT = float(os.getenv("CAI_TIMEOUT", 10))
+USER_ID_TO_PUSH = os.getenv("LINE_USER_ID")  # 由 c.ai 推播卡片的對象
 MONITORED_USER_ID = int(os.getenv("MONITORED_USER_ID", 1))
 
 print("=" * 60)
-print("📱 LINE Bot 設定")
-print(f"✅ TOKEN: {LINE_CHANNEL_ACCESS_TOKEN[:30]}..." if LINE_CHANNEL_ACCESS_TOKEN else "❌ TOKEN 未設定")
+print("🤖 c.ai 平台設定")
+print(f"✅ ETA_URL: {CAI_ETA_URL}" if CAI_ETA_URL else "❌ ETA_URL 未設定")
+print(f"✅ BOT_ID: {CAI_BOT_ID}" if CAI_BOT_ID else "❌ BOT_ID 未設定")
+print("✅ SUBSCRIPTION_KEY: 已設定" if CAI_SUBSCRIPTION_KEY else "❌ SUBSCRIPTION_KEY 未設定")
+print(f"✅ EVENT_NAME: {CAI_EVENT_NAME}")
 print(f"✅ USER_ID: {USER_ID_TO_PUSH}" if USER_ID_TO_PUSH else "⚠️  USER_ID 未設定")
 print(f"✅ 監控用户 ID: {MONITORED_USER_ID}")
 print("=" * 60)
-
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN) if LINE_CHANNEL_ACCESS_TOKEN else None
 
 # 初始化數據庫
 try:
@@ -40,122 +46,50 @@ except Exception as e:
     logger.warning(f"⚠️  數據庫初始化失敗: {e}（繼續運行）")
 
 
-def build_fall_alert_card(timestamp):
-  """構建完整的跌倒告警 Flex Message"""
-  return {
-      "type": "bubble",
-      "styles": {
-          "header": {"backgroundColor": "#FF3B30"},
-          "footer": {"separator": True},
-      },
-      "header": {
-          "type": "box",
-          "layout": "vertical",
-          "contents": [
-              {
-                  "type": "text",
-                  "text": "🚨 長者跌倒告警 - 緊急...",
-                  "weight": "bold",
-                  "color": "#FFFFFF",
-                  "size": "lg",
-              }
-          ],
-      },
-      "body": {
-          "type": "box",
-          "layout": "vertical",
-          "contents": [
-              {
-                  "type": "text",
-                  "text": "⚠️ 偵測到長者跌倒超過 10 秒！",
-                  "weight": "bold",
-                  "size": "md",
-                  "color": "#FF3B30",
-                  "wrap": True,
-              },
-              {
-                  "type": "box",
-                  "layout": "vertical",
-                  "margin": "md",
-                  "spacing": "xs",
-                  "contents": [
-                      {
-                          "type": "text",
-                          "text": f"📅 時間：{timestamp}",
-                          "size": "sm",
-                          "color": "#666666",
-                      },
-                      {
-                          "type": "text",
-                          "text": "📍 位置：監控區域",
-                          "size": "sm",
-                          "color": "#666666",
-                      },
-                      {
-                          "type": "text",
-                          "text": "🤖 狀態：系統已啟動救援",
-                          "size": "sm",
-                          "color": "#1DB446",
-                          "weight": "bold",
-                      },
-                  ],
-              },
-              {"type": "separator", "margin": "md"},
-              {
-                  "type": "box",
-                  "layout": "vertical",
-                  "margin": "md",
-                  "spacing": "xs",
-                  "contents": [
-                      {
-                          "type": "text",
-                          "text": "【救援進程】",
-                          "size": "xs",
-                          "color": "#888888",
-                          "weight": "bold",
-                      },
-                      {
-                          "type": "text",
-                          "text": "1️⃣ 系統已確認：跌倒超過 10 秒",
-                          "size": "xs",
-                          "color": "#333333",
-                      },
-                      {
-                          "type": "text",
-                          "text": "2️⃣ 通知家屬：已推播 LINE 告警",
-                          "size": "xs",
-                          "color": "#FF3B30",
-                          "weight": "bold",
-                      },
-                      {
-                          "type": "text",
-                          "text": "3️⃣ 立即行動：請確認長者狀態",
-                          "size": "xs",
-                          "color": "#FF3B30",
-                          "weight": "bold",
-                      },
-                  ],
-              },
-          ],
-      },
-      "footer": {
-          "type": "box",
-          "layout": "vertical",
-          "spacing": "sm",
-          "contents": [
-              {
-                  "type": "button",
-                  "action": {
-                      "type": "message",
-                      "label": "✅ 確認平安（解除告警）",
-                      "text": "確認長者平安",
-                  },
-                  "style": "primary",
-                  "color": "#1DB446",
-              },
-          ],
-      },
+def cai_configured():
+  return bool(CAI_ETA_URL and CAI_BOT_ID and CAI_SUBSCRIPTION_KEY)
+
+
+def send_fall_event_to_cai(event_time, confidence, location):
+  """透過 ETA「發送事件訊息」API 觸發 c.ai 事件，由 c.ai 腳本推播跌倒通報卡片到 LINE Bot
+
+  規格：C.ai 對話服務平台規格文件 1.2.3「1-1 發送事件訊息」
+  """
+  url = f"{CAI_ETA_URL.rstrip('/')}/api/subscription/{CAI_BOT_ID}/event/multicast"
+  headers = {
+      "x-gss-event-subscription-key": CAI_SUBSCRIPTION_KEY,
+      "x-gss-event-from": CAI_BOT_ID,
+      "content-type": "application/json",
   }
+  conversation = {
+      "Id": "",  # Line 頻道留空
+      "RecipientId": USER_ID_TO_PUSH,
+      "Subject": "長者跌倒告警",
+      "IsGroup": False,
+  }
+  if CAI_CHANNEL:
+    conversation["ChannelList"] = {"InclusionChannels": CAI_CHANNEL}
+  payload = {
+      "TriggerId": CAI_BOT_ID,
+      "Conversations": [conversation],
+      "Event": {
+          "Name": CAI_EVENT_NAME,
+          # 對應 c.ai 跌倒通報卡片中的 {timestamp}、{location} 變數
+          "Value": {
+              "timestamp": event_time,
+              "location": location,
+              "confidence": confidence,
+          },
+      },
+      "Message": None,
+  }
+  response = requests.post(url, json=payload, headers=headers, timeout=CAI_TIMEOUT)
+  response.raise_for_status()
+  # ETA 以回應內容的 status 表示結果：200 成功、401 認證失敗、500 其他錯誤
+  result = response.json()
+  if str(result.get("status")) != "200":
+    raise requests.RequestException(f"ETA 回應 {result.get('status')}: {result.get('message')}")
+  return response
 
 
 @app.route("/api/fall_event", methods=["POST"])
@@ -168,27 +102,23 @@ def handle_fall_event():
 
   logger.info(f"🚨 收到跌倒事件 - 時間: {event_time}, 置信度: {confidence:.2%}, 位置: {location}")
 
-  if not line_bot_api or not USER_ID_TO_PUSH:
-    logger.error("❌ LINE 設定不完整")
-    return jsonify({"status": "error", "message": "LINE 設定不完整"}), 400
+  if not cai_configured() or not USER_ID_TO_PUSH:
+    logger.error("❌ c.ai 設定不完整")
+    return jsonify({"status": "error", "message": "c.ai 設定不完整"}), 400
 
-  # 第一步：推送 LINE 警報
+  # 第一步：送到 c.ai（由 c.ai 推播卡片到 LINE Bot）
   alert_success = False
   alert_time = None
   try:
-    card = build_fall_alert_card(event_time)
-    line_bot_api.push_message(
-        USER_ID_TO_PUSH,
-        FlexSendMessage(alt_text="🚨 長者跌倒告警", contents=card)
-    )
-    logger.info("✅ 已推送告警卡片到 LINE")
+    send_fall_event_to_cai(event_time, confidence, location)
+    logger.info("✅ 已送出跌倒事件到 c.ai")
     alert_success = True
     alert_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-  except LineBotApiError as e:
-    logger.error(f"❌ LINE 推送失敗: {e}")
+  except requests.RequestException as e:
+    logger.error(f"❌ c.ai 送出失敗: {e}")
     alert_success = False
 
-  # 第二步：記錄到數據庫（獨立於 LINE 推送結果）
+  # 第二步：記錄到數據庫（獨立於 c.ai 送出結果）
   db_success = False
   event_id = None
   try:
@@ -209,7 +139,7 @@ def handle_fall_event():
     logger.info(f"✅ 跌倒事件已記錄到數據庫 - 事件 ID: {event_id}")
     db_success = True
   except Exception as e:
-    logger.error(f"⚠️  數據庫記錄失敗: {e}（但警報已推送）", exc_info=True)
+    logger.error(f"⚠️  數據庫記錄失敗: {e}（但已送出到 c.ai）", exc_info=True)
     db_success = False
 
   # 第三步：返回結果
@@ -271,27 +201,25 @@ def health():
   return jsonify({"status": "ok"}), 200
 
 
-@app.route("/test_line", methods=["GET"])
-def test_line():
-  """測試 LINE 推送"""
-  print("\n🧪 測試 LINE 推送...")
+@app.route("/test_cai", methods=["GET"])
+def test_cai():
+  """測試 c.ai 送出（c.ai 會推播卡片到 LINE Bot）"""
+  print("\n🧪 測試 c.ai 送出...")
 
-  if not line_bot_api:
-    print("❌ TOKEN 未設定")
-    return jsonify({"error": "TOKEN not set"}), 400
+  if not cai_configured():
+    print("❌ c.ai 設定不完整")
+    return jsonify({"error": "c.ai not configured"}), 400
 
   if not USER_ID_TO_PUSH:
     print("❌ USER_ID 未設定")
     return jsonify({"error": "USER_ID not set"}), 400
 
   try:
-    card = build_fall_alert_card(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-    line_bot_api.push_message(
-        USER_ID_TO_PUSH,
-        FlexSendMessage(alt_text="🧪 測試訊息", contents=card)
+    response = send_fall_event_to_cai(
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 0.90, "測試區域"
     )
-    print("✅ 測試卡片已發送")
-    return jsonify({"status": "success"}), 200
+    print(f"✅ c.ai 回應: {response.status_code} {response.text[:200]}")
+    return jsonify({"status": "success", "cai_status": response.status_code}), 200
   except Exception as e:
     print(f"❌ 錯誤: {e}")
     return jsonify({"error": str(e)}), 500
