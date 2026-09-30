@@ -376,7 +376,13 @@ def main(source=0):
   roi = None
   roi_lock_frame = 0
   motion_tracker = MotionTracker()
+  motion_seen_during_fall = False
+  last_motion_fall_time = None
   GRACE_PERIOD_SECONDS = 3.0  # 進入跌倒狀態後,允許中斷(掙扎/暫時抓不到骨架)的最大容忍秒數
+  EXTENDED_GRACE_PERIOD_SECONDS = 10.0  # 若倒下瞬間有偵測到明確的下墜動態,代表真的發生過快速倒下,
+  # 之後即使朝鏡頭方向倒地(躺平後寬高比仍是「窄高」,偵測不到)也放寬容忍時間,不要太快判定「起身」
+  MOTION_TRIGGER_WINDOW_SECONDS = 10.0  # 偵測到快速下墜動態後,這段時間內持續嘗試 vLLM 確認,
+  # 不必等寬高比連續 5 幀穩定達標,避免倒下瞬間畫面模糊/角度不佳被 vLLM 拒絕一次就永久錯過
   FALL_CONFIRM_SECONDS = 5.0  # 跌倒狀態持續多久才確認送出警報
 
   while cap.isOpened():
@@ -416,14 +422,24 @@ def main(source=0):
     motion_is_fall = motion_tracker.update(raw_points, now)
     is_fall = pose_is_fall or motion_is_fall
 
+    if motion_is_fall:
+      motion_seen_during_fall = True
+      last_motion_fall_time = now
+
     if is_fall:
       last_fall_seen_time = now
 
     fall_cnt = (fall_cnt + 1) if is_fall else 0
     stable = fall_cnt >= 5
+    motion_recently_seen = (
+        last_motion_fall_time is not None
+        and (now - last_motion_fall_time).total_seconds() <= MOTION_TRIGGER_WINDOW_SECONDS
+    )
 
-    # 尚未進入跌倒狀態時,需連續穩定偵測到才觸發,避免單幀誤判
-    if stable and fall_time is None:
+    # 尚未進入跌倒狀態時,寬高比連續穩定達標,或是最近偵測過明確的下墜動態,
+    # 就嘗試 vLLM 確認(後者不必等寬高比連續 5 幀,因為倒下瞬間畫面角度不佳
+    # 時,寬高比可能不會再次穩定達標,但動態訊號已經足以懷疑真的跌倒了)
+    if (stable or motion_recently_seen) and fall_time is None:
       can_check_vllm = (
           last_vllm_check_time is None
           or (now - last_vllm_check_time).total_seconds() > VLLM_COOLDOWN_SECONDS
@@ -443,12 +459,18 @@ def main(source=0):
 
     if fall_time is not None:
       # 已進入跌倒狀態:掙扎/移動導致暫時偵測不到跌倒姿態(甚至骨架抓不到)
-      # 不算解除,只有連續超過寬容期都沒再偵測到才視為真正起身
-      since_last_seen = (now - last_fall_seen_time).total_seconds() if last_fall_seen_time else GRACE_PERIOD_SECONDS + 1
+      # 不算解除,只有連續超過寬容期都沒再偵測到才視為真正起身。
+      # 若倒下瞬間確實偵測到快速下墜的動態訊號(motion_seen_during_fall),
+      # 代表這是真的跌倒(可能朝鏡頭方向倒地,躺平後寬高比判斷不出來),
+      # 用延長過的寬容期,避免太快被誤判成起身
+      effective_grace_period = EXTENDED_GRACE_PERIOD_SECONDS if motion_seen_during_fall else GRACE_PERIOD_SECONDS
+      since_last_seen = (now - last_fall_seen_time).total_seconds() if last_fall_seen_time else effective_grace_period + 1
 
-      if since_last_seen > GRACE_PERIOD_SECONDS:
+      if since_last_seen > effective_grace_period:
         print(f'{now_str} 跌倒狀態解除(起身)')
         fall_time, reported, fall_cnt = None, False, 0
+        motion_seen_during_fall = False
+        last_motion_fall_time = None
         frame = draw_chinese_text(frame, '正常', (20, 40), font_large, (0, 255, 0))
       else:
         elapsed = (now - fall_time).total_seconds()
@@ -477,6 +499,8 @@ def main(source=0):
       break
     elif key == ord('r'):
       fall_time, reported, fall_cnt = None, False, 0
+      motion_seen_during_fall = False
+      last_motion_fall_time = None
       motion_tracker.reset()
     elif key == ord('c'):
       roi = None
