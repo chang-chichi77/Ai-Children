@@ -2,6 +2,7 @@
 import argparse
 import math
 import os
+import threading
 import time
 from collections import deque
 import cv2
@@ -31,15 +32,22 @@ CONNECTIONS = [(c.start, c.end) for c in vision.PoseLandmarksConnections.POSE_LA
 
 try:
   font_path = '/System/Library/Fonts/STHeiti Light.ttc'
-  font_large = ImageFont.truetype(font_path, 32)
-  font_medium = ImageFont.truetype(font_path, 24)
-  font_small = ImageFont.truetype(font_path, 16)
+  font_large = ImageFont.truetype(font_path, 40)
+  font_medium = ImageFont.truetype(font_path, 30)
+  font_small = ImageFont.truetype(font_path, 20)
 except:
   font_large = font_medium = font_small = ImageFont.load_default()
 
 def draw_chinese_text(img, text, pos, font, color=(255, 255, 255)):
+  """color 採用跟專案其他畫面元素(cv2.rectangle 等)一致的 BGR 順序。
+
+  PIL 的 fill 參數是 RGB,這裡轉換成 RGB 繪製後再轉回 BGR 輸出,
+  若直接把呼叫端的 BGR tuple 原封不動傳給 PIL,R/B 色版會對調
+  (例如原本想畫紅色 (0,0,255) 會變成畫出藍色)。
+  """
   img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-  ImageDraw.Draw(img_pil).text(pos, text, font=font, fill=color)
+  rgb_color = (color[2], color[1], color[0])
+  ImageDraw.Draw(img_pil).text(pos, text, font=font, fill=rgb_color)
   return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 def enhance_image(frame):
@@ -340,11 +348,57 @@ class MotionTracker:
 
     return is_fast_fall or accel_triggered
 
+_VLLM_PENDING = object()  # 尚未有結果回來的佔位值,跟 confirm_fall() 合法回傳的 None(連線失敗)區分開來
+
+class VllmChecker:
+  """在背景執行緒呼叫 vLLM 二次確認,不阻塞主迴圈畫面更新。
+
+  confirm_fall() 是同步的 HTTP 請求,直接在主迴圈呼叫會讓畫面卡住等待回應。
+  這裡改成丟給背景執行緒跑,主迴圈只需要每幀「問一下有沒有結果」(poll),
+  讓跌倒倒數可以立刻開始、画面不被擋住,vLLM 的結果晚一點回來再補判斷。
+  """
+
+  def __init__(self):
+    self.box = None  # None=目前沒有在跑;[_VLLM_PENDING]=執行中;[result]=有結果等著被讀取
+    self.last_started = None
+
+  def maybe_start(self, frame, now, cooldown):
+    if self.box is not None and self.box[0] is _VLLM_PENDING:
+      return  # 上一次還沒回來,不要疊加呼叫
+    if self.last_started is not None and (now - self.last_started).total_seconds() < cooldown:
+      return
+    self.last_started = now
+    box = [_VLLM_PENDING]
+    snapshot = frame.copy()
+
+    def _run():
+      box[0] = confirm_fall(snapshot, VLLM_BASE_URL, VLLM_MODEL)
+
+    threading.Thread(target=_run, daemon=True).start()
+    self.box = box
+
+  def poll(self):
+    """有新結果就回傳並清空;還在等就回傳 _VLLM_PENDING。"""
+    if self.box is None or self.box[0] is _VLLM_PENDING:
+      return _VLLM_PENDING
+    result = self.box[0]
+    self.box = None
+    return result
+
+  def reset(self):
+    self.box = None
+    self.last_started = None
+
 def send_alert(ts):
+  """回傳是否「真的」推播成功(家屬/119 有收到),不是單純送出請求就算數。"""
   try:
-    requests.post(FLASK_API_URL, json={'event': 'fall_5s_confirmed', 'time': ts, 'confidence': 0.90}, timeout=5)
-    print('警報已送出')
-    return True
+    response = requests.post(FLASK_API_URL, json={'event': 'fall_5s_confirmed', 'time': ts, 'confidence': 0.90}, timeout=5)
+    delivered = bool(response.json().get('alert_sent'))
+    if delivered:
+      print('警報已送出,且已確認推播給家屬')
+    else:
+      print('警報已送出,但尚未確認有實際推播給家屬')
+    return delivered
   except Exception as e:
     print(f'警報送出失敗:{e}')
     return False
@@ -371,8 +425,10 @@ def main(source=0):
   landmarker = create_pose_landmarker()
   object_detector = create_object_detector()
   fc, fall_time, reported, fall_cnt = 0, None, False, 0
+  alert_delivered = False
   last_fall_seen_time = None
-  last_vllm_check_time = None
+  vllm_checker = VllmChecker()
+  vllm_veto_checked = False
   roi = None
   roi_lock_frame = 0
   motion_tracker = MotionTracker()
@@ -383,7 +439,7 @@ def main(source=0):
   # 之後即使朝鏡頭方向倒地(躺平後寬高比仍是「窄高」,偵測不到)也放寬容忍時間,不要太快判定「起身」
   MOTION_TRIGGER_WINDOW_SECONDS = 10.0  # 偵測到快速下墜動態後,這段時間內持續嘗試 vLLM 確認,
   # 不必等寬高比連續 5 幀穩定達標,避免倒下瞬間畫面模糊/角度不佳被 vLLM 拒絕一次就永久錯過
-  FALL_CONFIRM_SECONDS = 5.0  # 跌倒狀態持續多久才確認送出警報
+  FALL_CONFIRM_SECONDS = 10.0  # 跌倒狀態持續多久才確認送出警報
 
   while cap.isOpened():
     ret, frame = cap.read()
@@ -437,25 +493,31 @@ def main(source=0):
     )
 
     # 尚未進入跌倒狀態時,寬高比連續穩定達標,或是最近偵測過明確的下墜動態,
-    # 就嘗試 vLLM 確認(後者不必等寬高比連續 5 幀,因為倒下瞬間畫面角度不佳
-    # 時,寬高比可能不會再次穩定達標,但動態訊號已經足以懷疑真的跌倒了)
+    # 就立刻進入倒數狀態(不等 vLLM 回應,避免同步呼叫擋住畫面造成卡頓)。
+    # vLLM 二次確認改在背景執行緒跑,晚一點用 vllm_veto_checked 那段邏輯補判斷:
+    # 如果確認是「非跌倒」才取消這次警報,等於是事後否決,不是事前阻擋。
     if (stable or motion_recently_seen) and fall_time is None:
-      can_check_vllm = (
-          last_vllm_check_time is None
-          or (now - last_vllm_check_time).total_seconds() > VLLM_COOLDOWN_SECONDS
-      )
-      if can_check_vllm:
-        last_vllm_check_time = now
-        vllm_result = confirm_fall(frame, VLLM_BASE_URL, VLLM_MODEL)
+      fall_time = now
+      vllm_veto_checked = False
+      vllm_checker.reset()
+      vllm_checker.maybe_start(frame, now, VLLM_COOLDOWN_SECONDS)
+      print(f'{now_str} 偵測到跌倒(MediaPipe 判斷),開始倒數,背景執行 vLLM 二次確認中...')
+
+    if fall_time is not None and not reported and not vllm_veto_checked:
+      vllm_result = vllm_checker.poll()
+      if vllm_result is _VLLM_PENDING:
+        vllm_checker.maybe_start(frame, now, VLLM_COOLDOWN_SECONDS)
+      else:
+        vllm_veto_checked = True
         if vllm_result is False:
-          # vLLM 明確判斷非跌倒/非人,暫不觸發,冷卻時間內不重複呼叫
-          print(f'{now_str} MediaPipe 疑似跌倒,但 vLLM 二次確認為非跌倒,暫不觸發')
+          # vLLM 事後否決,取消這次警報(不阻塞畫面,但仍然保有二次確認的把關效果)
+          print(f'{now_str} vLLM 二次確認為非跌倒,取消本次警報')
+          fall_time, reported, fall_cnt = None, False, 0
+          alert_delivered = False
+        elif vllm_result is None:
+          print(f'{now_str} vLLM 無法連線,退回 MediaPipe 單獨判斷')
         else:
-          fall_time = now
-          if vllm_result is None:
-            print(f'{now_str} 偵測到跌倒(vLLM 無法連線,退回 MediaPipe 單獨判斷)')
-          else:
-            print(f'{now_str} 偵測到跌倒(MediaPipe + vLLM 雙重確認)')
+          print(f'{now_str} vLLM 二次確認通過(雙重確認)')
 
     if fall_time is not None:
       # 已進入跌倒狀態:掙扎/移動導致暫時偵測不到跌倒姿態(甚至骨架抓不到)
@@ -471,6 +533,9 @@ def main(source=0):
         fall_time, reported, fall_cnt = None, False, 0
         motion_seen_during_fall = False
         last_motion_fall_time = None
+        alert_delivered = False
+        vllm_veto_checked = False
+        vllm_checker.reset()
         frame = draw_chinese_text(frame, '正常', (20, 40), font_large, (0, 255, 0))
       else:
         elapsed = (now - fall_time).total_seconds()
@@ -479,10 +544,18 @@ def main(source=0):
         if elapsed >= FALL_CONFIRM_SECONDS and not reported:
           reported = True
           print(f'跌倒狀態已持續超過 {FALL_CONFIRM_SECONDS:.0f} 秒，確認警報!')
-          send_alert(now_str)
+          alert_delivered = send_alert(now_str)
 
-        frame = draw_chinese_text(frame, '危險 - 偵測到跌倒', (20, 40), font_large, (0, 0, 255))
-        frame = draw_chinese_text(frame, f'倒數計時：{remaining:.1f} 秒', (20, 80), font_medium, (0, 0, 255))
+        if reported and alert_delivered:
+          # 已經「確定」推播成功給家屬/119(不是單純送出請求),才切換顯示文字
+          frame = draw_chinese_text(frame, '危險 已推播至家屬及119', (20, 40), font_large, (0, 0, 255))
+        elif reported:
+          # 倒數已結束、警報已送出但推播未確認成功:不要再顯示「倒數 0.0 秒」誤導成沒在倒數
+          frame = draw_chinese_text(frame, '危險 - 偵測到跌倒', (20, 40), font_large, (0, 0, 255))
+          frame = draw_chinese_text(frame, '警報已送出(推播未確認)', (20, 95), font_medium, (0, 0, 255))
+        else:
+          frame = draw_chinese_text(frame, '危險 - 偵測到跌倒', (20, 40), font_large, (0, 0, 255))
+          frame = draw_chinese_text(frame, f'倒數計時：{remaining:.1f} 秒', (20, 95), font_medium, (0, 0, 255))
     else:
       frame = draw_chinese_text(frame, '正常', (20, 40), font_large, (0, 255, 0))
 
@@ -490,8 +563,8 @@ def main(source=0):
       x1, y1, x2, y2 = roi
       cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 255), 2)
 
-    frame = draw_chinese_text(frame, now_str, (fw - 280, 20), font_medium, (255, 255, 255))
-    frame = draw_chinese_text(frame, f'FPS: {display_fps:.1f}', (fw - 280, 50), font_medium, (255, 255, 255))
+    frame = draw_chinese_text(frame, now_str, (fw - 400, 20), font_large, (255, 255, 255))
+    frame = draw_chinese_text(frame, f'FPS: {display_fps:.1f}', (fw - 280, 70), font_medium, (255, 255, 255))
     cv2.imshow('Fall Detection', frame)
 
     key = cv2.waitKey(1) & 0xFF
@@ -501,6 +574,9 @@ def main(source=0):
       fall_time, reported, fall_cnt = None, False, 0
       motion_seen_during_fall = False
       last_motion_fall_time = None
+      alert_delivered = False
+      vllm_veto_checked = False
+      vllm_checker.reset()
       motion_tracker.reset()
     elif key == ord('c'):
       roi = None
